@@ -1,895 +1,705 @@
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::collections::{HashMap, hash_map::Entry};
 
-use crate::{lexer::Span, parse::{Ast, Type, Monotype, BaseType, Pattern}};
+use crate::ast::*;
 
 #[derive(Debug)]
-pub struct CheckError {
+struct TypeData {
+    va_params: bool,
+    params: Vec<String>,
+    variants: Vec<Variant>,
+}
+
+struct GlobalData {
+    type_: Type,
+    variant_of: Option<String>,
+}
+
+pub struct TypeError {
     pub message: String,
-    pub primary_label: String,
-    pub primary_label_loc: Span,
-    pub secondary_labels: Vec<(String, Span)>,
-    pub notes: Vec<String>,
 }
 
-#[derive(Debug)]
-struct Instance {
-    generics: Vec<String>,
-    parameters: Vec<Monotype>,
-    constraints: Vec<(String, Vec<Monotype>)>,
-}
+pub fn typecheck(ast: &[TopLevel]) -> Result<(), TypeError> {
+    // set up scopes
+    let mut globals = HashMap::new();
+    let mut defined_types = HashMap::new();
+    let mut type_vars = Vec::new();
+    defined_types.insert("Tuple".to_owned(), TypeData {
+        va_params: true,
+        params: Vec::new(),
+        variants: Vec::new(),
+    });
+    defined_types.insert("Int".to_owned(), TypeData {
+        va_params: false,
+        params: Vec::new(),
+        variants: Vec::new(),
+    });
+    defined_types.insert("Unit".to_owned(), TypeData {
+        va_params: false,
+        params: Vec::new(),
+        variants: Vec::new(),
+    });
+    defined_types.insert("String".to_owned(), TypeData {
+        va_params: false,
+        params: Vec::new(),
+        variants: Vec::new(),
+    });
+    defined_types.insert("Pointer".to_owned(), TypeData {
+        va_params: false,
+        params: vec!["T".to_string()],
+        variants: Vec::new(),
+    });
 
-#[derive(Debug)]
-struct Class {
-    parameter_count: usize,
-    instances: Vec<Instance>,
-    superclasses: HashMap<String, Vec<usize>>,
-}
-
-#[derive(Default, Debug)]
-struct Environment {
-    variables: Vec<(String, Type)>,
-    constructors: HashMap<String, Type>,
-    // types_defined: HashMap<String, Type>, // TODO: check if a type used was previously defined
-    classes: HashMap<String, Class>,
-
-    substitutions: Vec<Monotype>,
-    class_constraints: Vec<Vec<(String, usize)>>, // kinda silly but states that, for a given type variable t, it is the ith argument of some instance of the given class
-}
-
-impl Environment {
-    fn init_defaults(mut self) -> Self {
-        self.variables.push(("+".to_string(), Type {
-            foralls: Vec::new(),
-            constraints: Vec::new(),
-            monotype: Monotype::Func(Box::new(Monotype::Base(BaseType::I32)), Box::new(Monotype::Func(Box::new(Monotype::Base(BaseType::I32)), Box::new(Monotype::Base(BaseType::I32))))),
-        }));
-        self
-    }
-
-    fn push_var(&mut self, var: String, type_: Type) {
-        self.variables.push((var, type_));
-    }
-
-    fn find_var(&mut self, var: &str) -> Option<Monotype> {
-        for (key, type_) in self.variables.iter().rev() {
-            if key == var {
-                return Some(type_.clone().instantiate(self));
-            }
-        }
-
-        return None;
-    }
-
-    fn find_var_no_inst(&self, var: &str) -> Option<Type> {
-        self.variables.iter().rev().find(|(v, _)| v == var).map(|(_, t)| t.clone())
-    }
-
-    fn find_cons(&mut self, cons: &str) -> Option<Monotype> {
-        self.constructors.get(cons).cloned().map(|v| v.instantiate(self))
-    }
-
-    fn pop_var(&mut self) -> Option<(String, Type)> {
-        self.variables.pop()
-    }
-
-    fn new_var(&mut self) -> Monotype {
-        let t = Monotype::TypeVar(self.substitutions.len());
-        self.substitutions.push(t.clone());
-        self.class_constraints.push(Vec::new());
-        t
-    }
-
-    fn find(&self, t: &Monotype) -> Monotype {
-        let mut t = t.clone();
-        while let Monotype::TypeVar(i) = t {
-            let t_new = &self.substitutions[i];
-            if matches!(t_new, &Monotype::TypeVar(j) if i == j) {
-                break;
-            }
-            t = t_new.clone();
-        }
-
-        match t {
-            Monotype::Base(BaseType::Named(s, ts)) => Monotype::Base(BaseType::Named(s, ts.into_iter().map(|v| self.find(&v)).collect())),
-            Monotype::Func(a, r) => Monotype::Func(Box::new(self.find(&a)), Box::new(self.find(&r))),
-            t => t
-        }
-    }
-
-    fn unify(&mut self, ta: &mut Monotype, tb: &mut Monotype) -> bool {
-        *ta = self.find(ta);
-        *tb = self.find(tb);
-
-        match (ta, tb) {
-            (Monotype::Base(BaseType::Bottom), _) | (_, Monotype::Base(BaseType::Bottom)) => true,
-            (ta, tb) if ta == tb => true,
-
-            (Monotype::Base(BaseType::Named(c1, ts1)), Monotype::Base(BaseType::Named(c2, ts2))) if c1 == c2 && ts1.len() == ts2.len() => {
-                ts1.iter_mut().zip(ts2.iter_mut()).all(|(a, b)| self.unify(a, b))
-            }
-
-            (Monotype::Func(a1, r1), Monotype::Func(a2, r2)) => {
-                self.unify(a1, a2) && self.unify(r1, r2)
-            }
-
-            (v @ Monotype::TypeVar(_), t) | (t, v @ Monotype::TypeVar(_)) => {
-                if let Monotype::TypeVar(i) = v {
-                    self.substitutions[*i] = t.clone();
-                } else {
-                    unreachable!();
-                }
-
-                *v = t.clone();
-                true
-            }
-
-            _ => false,
-        }
-    }
-
-    fn update_all_var_types(&mut self) {
-        let mut variables = Vec::new();
-        std::mem::swap(&mut variables, &mut self.variables);
-        for (_, t) in variables.iter_mut() {
-            t.monotype = self.find(&t.monotype);
-            t.polymorphise(self);
-        }
-        std::mem::swap(&mut variables, &mut self.variables);
-    }
-}
-
-impl Type {
-    fn instantiate(self, env: &mut Environment) -> Monotype {
-        let mut replacements = HashMap::new();
-        for generic in self.foralls {
-            replacements.insert(generic.clone(), env.new_var());
-        }
-
-        let mut constraint_map = HashMap::new();
-        for (class_name, params) in self.constraints {
-            // TODO: error handling
-            if let Some(class) = env.classes.get(&class_name) {
-                for (i, param) in params.into_iter().enumerate() {
-                    param.instantiate(&replacements).create_typevar_constraints(i, &class_name, class, &mut constraint_map);
-                }
-            }
-        }
-
-        for (i, vals) in constraint_map {
-            env.class_constraints[i].extend(vals);
-        }
-
-        self.monotype.instantiate(&replacements)
-    }
-
-    fn polymorphise(&mut self, env: &Environment) {
-        let mut new_generics = HashSet::new();
-        self.monotype.polymorphise(env, &mut new_generics);
-
-        for new in new_generics {
-            self.foralls.push(new);
-        }
-    }
-}
-
-impl Monotype {
-    fn create_typevar_constraints(self, i: usize, class_name: &str, class: &Class, constraint_map: &mut HashMap<usize, Vec<(String, usize)>>) {
-        match self {
-            Monotype::Base(BaseType::Named(_, ts)) => {
-                for t in ts {
-                    t.create_typevar_constraints(i, class_name, class, constraint_map);
-                }
-            }
-
-            Monotype::Func(a, r) => {
-                a.create_typevar_constraints(i, class_name, class, constraint_map);
-                r.create_typevar_constraints(i, class_name, class, constraint_map);
-            }
-
-            Monotype::TypeVar(j) => {
-                match constraint_map.entry(j) {
-                    Entry::Occupied(mut v) => {
-                        v.get_mut().push((class_name.to_string(), i));
-                    }
-
-                    Entry::Vacant(v) => {
-                        v.insert(vec![(class_name.to_string(), i)]);
-                    }
-                }
-            }
-
-            _ => (),
-        }
-    }
-
-    fn instantiate(self, replacements: &HashMap<String, Monotype>) -> Self {
-        match self {
-            Monotype::Unknown => self,
-
-            Monotype::Base(BaseType::Named(name, ts)) => {
-                Monotype::Base(BaseType::Named(name, ts.into_iter().map(|v| v.instantiate(replacements)).collect()))
-            }
-
-            Monotype::Base(_) => self,
-
-            Monotype::Func(a, r) => {
-                Monotype::Func(Box::new(a.instantiate(replacements)), Box::new(r.instantiate(replacements)))
-            }
-
-            Monotype::Generic(g) => {
-                replacements.get(&g).expect("all generics must have been counted for in a universal type").clone()
-            }
-
-            Monotype::TypeVar(_) => self,
-        }
-    }
-
-    fn fresh(&mut self, env: &mut Environment, type_vars: &mut HashMap<usize, usize>) {
-        match self {
-            Monotype::Base(BaseType::Named(_, ts)) => {
-                for t in ts {
-                    t.fresh(env, type_vars);
-                }
-            }
-
-            Monotype::Func(a, r) => {
-                a.fresh(env, type_vars);
-                r.fresh(env, type_vars);
-            }
-
-            Monotype::TypeVar(i) => {
-                let i = *i;
-
-                match type_vars.entry(i) {
-                    Entry::Occupied(v) => {
-                        *self = Monotype::TypeVar(*v.get());
-                    }
-
-                    Entry::Vacant(v) => {
-                        let t = env.new_var();
-                        if let Monotype::TypeVar(j) = t {
-                            v.insert(j);
-                        }
-                        *self = t;
-                    }
-                }
-            }
-
-            _ => (),
-        }
-    }
-
-    fn polymorphise(&mut self, env: &Environment, new_generics: &mut HashSet<String>) {
-        match self {
-            Monotype::Base(BaseType::Named(_, ts)) => {
-                for t in ts {
-                    t.polymorphise(env, new_generics);
-                }
-            }
-
-            Monotype::Func(a, r) => {
-                a.polymorphise(env, new_generics);
-                r.polymorphise(env, new_generics);
-            }
-
-            Monotype::TypeVar(i) => {
-                let i = *i;
-                *self = env.find(self);
-                if let Monotype::TypeVar(_) = self {
-                    let new = format!("a${}", i);
-                    *self = Monotype::Generic(new.clone());
-                    new_generics.insert(new);
-                } else {
-                    self.polymorphise(env, new_generics);
-                }
-            }
-
-            _ => (),
-        }
-    }
-}
-
-fn typecheck_helper(ast: &mut Ast, env: &mut Environment, errors: &mut Vec<CheckError>) -> Monotype {
-    match ast {
-        Ast::Integer(_, _) => Monotype::Base(BaseType::I32),
-        Ast::Bool(_, _) => Monotype::Base(BaseType::Bool),
-
-        Ast::Symbol(span, s) => {
-            if let Some(t) = env.find_var(s) {
-                t
-            } else {
-                errors.push(CheckError {
-                    message: "symbol not found".to_string(),
-                    primary_label: format!("symbol `{}` was not previously declared", s),
-                    primary_label_loc: span.clone(),
-                    secondary_labels: Vec::new(),
-                    notes: Vec::new(),
-                });
-                Monotype::Base(BaseType::Bottom)
-            }
-        }
-
-        Ast::Binary { span, op, left, right } => {
-            if let Some(op_type) = env.find_var(op) {
-                let mut op_type = op_type.clone();
-                let t_left = typecheck_helper(left, env, errors);
-                let t_right = typecheck_helper(right, env, errors);
-                let ret = env.new_var();
-                if env.unify(&mut op_type, &mut Monotype::Func(Box::new(t_left.clone()), Box::new(Monotype::Func(Box::new(t_right.clone()), Box::new(ret.clone()))))) {
-                    env.find(&ret)
-                } else {
-                    errors.push(CheckError {
-                        message: "cannot unify op and arguments".to_string(),
-                        primary_label: format!("operator `{}` has type `{}`, whereas arguments are of types `{}` and `{}`", op, op_type, t_left, t_right),
-                        primary_label_loc: span.clone(),
-                        secondary_labels: Vec::new(),
-                        notes: Vec::new(),
+    // get all globals (functions and type definitions)
+    for top in ast {
+        match top {
+            TopLevel::TypeDef { name, generics, variants } => {
+                let Entry::Vacant(v) = defined_types.entry(name.clone())
+                else {
+                    return Err(TypeError {
+                        message: format!("redefinition of {name}"),
                     });
-                    Monotype::Base(BaseType::Bottom)
-                }
-            } else {
-                errors.push(CheckError {
-                    message: "op is undefined".to_string(),
-                    primary_label: format!("operator `{}` is undefined", op),
-                    primary_label_loc: span.clone(),
-                    secondary_labels: Vec::new(),
-                    notes: Vec::new(),
-                });
-                Monotype::Base(BaseType::Bottom)
-            }
-        }
-
-        Ast::FuncCall { span, func, args } => {
-            let mut t_func = typecheck_helper(func, env, errors);
-            for arg in args {
-                let t_arg = typecheck_helper(arg, env, errors);
-                let ret = env.new_var();
-                if env.unify(&mut t_func, &mut Monotype::Func(Box::new(t_arg.clone()), Box::new(ret.clone()))) {
-                    if let Monotype::Func(_, r) = t_func {
-                        t_func = env.find(&*r);
-                    }
-                } else {
-                    errors.push(CheckError {
-                        message: "invalid function application".to_string(),
-                        primary_label: format!("applied value of type `{}` to argument of type `{}`", t_func, t_arg),
-                        primary_label_loc: span.clone(),
-                        secondary_labels: Vec::new(),
-                        notes: Vec::new(),
-                    });
-                    t_func = Monotype::Base(BaseType::Bottom);
-                }
-            }
-
-            t_func
-        }
-
-        Ast::Let { symbol, args, value, context, .. } => {
-            for arg in args.iter() {
-                let monotype = env.new_var();
-                env.push_var(arg.clone(), Type {
-                    foralls: Vec::new(),
-                    constraints: Vec::new(),
-                    monotype,
-                });
-            }
-
-            let mut monotype = typecheck_helper(value, env, errors);
-            for _ in args.iter() {
-                let (_, a) = env.pop_var().expect("variable was not popped");
-                monotype = Monotype::Func(Box::new(a.monotype), Box::new(monotype));
-            }
-
-            env.push_var(symbol.clone(), Type {
-                foralls: Vec::new(),
-                constraints: Vec::new(),
-                monotype,
-            });
-            let result = typecheck_helper(context, env, errors);
-            env.pop_var();
-            result
-        }
-
-        Ast::EmptyLet { .. } => Monotype::Base(BaseType::Bottom),
-
-        Ast::TopLet { span, symbol, args, value } => {
-            for arg in args.iter() {
-                let monotype = env.new_var();
-                env.push_var(arg.to_string(), Type {
-                    foralls: Vec::new(),
-                    constraints: Vec::new(),
-                    monotype,
-                });
-            }
-
-            let mut t = typecheck_helper(value, env, errors);
-
-            for _ in args.iter().rev() {
-                let (_, a) = env.pop_var().expect("argument was never popped");
-                t = Monotype::Func(Box::new(a.monotype), Box::new(t));
-            }
-
-            let mut old = env.variables.iter().rev().find(|(n, _)| n == symbol).map(|(_, t)| t.clone()).expect("top level bindings are defined before typechecking starts");
-            if !old.foralls.is_empty() {
-                let mut t = env.find(&t);
-                t.fresh(env, &mut HashMap::new());
-                if !env.unify(&mut old.monotype, &mut t) {
-                    errors.push(CheckError {
-                        message: "top level binding cannot be typechecked".to_string(),
-                        primary_label: format!("`{}` has both types `{}` and `{}`", symbol, old, t),
-                        primary_label_loc: span.clone(),
-                        secondary_labels: Vec::new(),
-                        notes: Vec::new(),
-                    });
-                }
-            }
-
-            let mut old = env.find_var(symbol).expect("top level bindings are defined before typechecking starts");
-            if !env.unify(&mut t, &mut old) {
-                errors.push(CheckError {
-                    message: "top level binding cannot be typechecked".to_string(),
-                    primary_label: format!("`{}` has both types `{}` and `{}`", symbol, old, t),
-                    primary_label_loc: span.clone(),
-                    secondary_labels: Vec::new(),
-                    notes: Vec::new(),
-                });
-            }
-
-            Monotype::Base(BaseType::Bottom)
-        }
-
-        Ast::If { span, cond, then, elsy } => {
-            let mut t_cond = typecheck_helper(cond, env, errors);
-            if !env.unify(&mut t_cond, &mut Monotype::Base(BaseType::Bool)) {
-                errors.push(CheckError {
-                    message: "expected value of type `bool` in condition of if expression".to_string(),
-                    primary_label: format!("value has type `{}` instead of `bool`", t_cond),
-                    primary_label_loc: cond.span(),
-                    secondary_labels: Vec::new(),
-                    notes: Vec::new(),
-                });
-            }
-
-            let mut t_then = typecheck_helper(then, env, errors);
-            let mut t_elsy = typecheck_helper(elsy, env, errors);
-
-            if env.unify(&mut t_then, &mut t_elsy) {
-                env.find(&t_then)
-            } else {
-                errors.push(CheckError {
-                    message: "branches of if expression do not match".to_string(),
-                    primary_label: format!("`{}` and `{}` are not equivalent types", t_then, t_elsy),
-                    primary_label_loc: span.clone(),
-                    secondary_labels: Vec::new(),
-                    notes: Vec::new(),
-                });
-                Monotype::Base(BaseType::Bottom)
-            }
-        }
-
-        Ast::DatatypeDefinition { .. } => Monotype::Base(BaseType::Bottom),
-
-        Ast::Match { span, value, patterns } => {
-            let mut t_value = typecheck_helper(value, env, errors);
-            let mut t = env.new_var();
-
-            for (pat, body) in patterns.iter_mut() {
-                let (mut t_pat, vars) = typecheck_pattern(pat, env, errors);
-                if !env.unify(&mut t_pat, &mut t_value) {
-                    errors.push(CheckError {
-                        message: "incompatible types among pattern and value".to_string(),
-                        primary_label: format!("pattern has type `{}` but value has incompatible type `{}`", t_pat, t_value),
-                        primary_label_loc: pat.span(),
-                        secondary_labels: Vec::new(),
-                        notes: Vec::new(),
-                    });
-                }
-
-                for (var, monotype) in vars.iter().cloned() {
-                    env.push_var(var, Type {
-                        foralls: Vec::new(),
-                        constraints: Vec::new(),
-                        monotype,
-                    });
-                }
-
-                let mut t_body = typecheck_helper(body, env, errors);
-                if !env.unify(&mut t, &mut t_body) {
-                    errors.push(CheckError {
-                        message: "match expression has incompatible types in branches".to_string(),
-                        primary_label: format!("two branches have types `{}` and `{}`", t, t_body),
-                        primary_label_loc: span.clone(),
-                        secondary_labels: Vec::new(),
-                        notes: Vec::new(),
-                    });
-                }
-
-                for _ in vars {
-                    env.pop_var();
-                }
-            }
-
-            t
-        }
-
-        Ast::Class { span, name, generics, constraints, functions } => {
-            // TODO
-            Monotype::Base(BaseType::Bottom)
-        }
-
-        // TODO: dealing with constraints
-        Ast::Instance { parameters, functions, .. } => {
-            for func in functions.iter_mut() {
-                if let Ast::TopLet { span, symbol, args, value } = func {
-                    for arg in args.iter() {
-                        let monotype = env.new_var();
-                        env.push_var(arg.to_string(), Type {
-                            foralls: Vec::new(),
-                            constraints: Vec::new(),
-                            monotype,
-                        });
-                    }
-
-                    let mut t = typecheck_helper(value, env, errors);
-
-                    for _ in args.iter().rev() {
-                        let (_, a) = env.pop_var().expect("argument was never popped");
-                        t = Monotype::Func(Box::new(a.monotype), Box::new(t));
-                    }
-
-                    let old = env.find_var_no_inst(symbol).expect("top level bindings are defined before typechecking starts");
-                    let replacements = old.foralls.iter().cloned().zip(parameters.iter().cloned()).collect();
-                    let mut old = old.monotype.instantiate(&replacements);
-                    if !env.unify(&mut t, &mut old) {
-                        errors.push(CheckError {
-                            message: "top level binding cannot be typechecked".to_string(),
-                            primary_label: format!("`{}` has both types `{}` and `{}`", symbol, old, t),
-                            primary_label_loc: span.clone(),
-                            secondary_labels: Vec::new(),
-                            notes: Vec::new(),
-                        });
-                    }
-                }
-            }
-
-            Monotype::Base(BaseType::Bottom)
-        }
-    }
-}
-
-fn typecheck_pattern(pattern: &mut Pattern, env: &mut Environment, errors: &mut Vec<CheckError>) -> (Monotype, Vec<(String, Monotype)>) {
-    match pattern {
-        Pattern::Wildcard(_) => (Monotype::Base(BaseType::Bottom), Vec::new()),
-
-        Pattern::Symbol(_, s) => {
-            let t = env.new_var();
-            (t.clone(), vec![(s.clone(), t)])
-        }
-
-        Pattern::Constructor(span, cons, pats) => {
-            if let Some(mut t_cons) = env.find_cons(cons) {
-                let mut new_env = Vec::new();
-                for pat in pats {
-                    let (mut t_pat, addition) = typecheck_pattern(pat, env, errors);
-
-                    for new in addition {
-                        if new_env.iter().any(|(v, _)| *v == new.0) {
-                            errors.push(CheckError {
-                                message: "variable declared multiple times in pattern".to_string(),
-                                primary_label: format!("variable `{}` declared at least twice", new.0),
-                                primary_label_loc: span.clone(),
-                                secondary_labels: Vec::new(),
-                                notes: Vec::new(),
-                            });
-                            continue;
-                        }
-
-                        new_env.push(new);
-                    }
-
-                    if let Monotype::Func(mut t_arg, t_ret) = t_cons {
-                        if !env.unify(&mut t_pat, &mut t_arg) {
-                            errors.push(CheckError {
-                                message: "pattern type does not match constructor".to_string(),
-                                primary_label: format!("constructor argument has type `{}` but type `{}` was provided", t_arg, t_pat),
-                                primary_label_loc: span.clone(),
-                                secondary_labels: Vec::new(),
-                                notes: Vec::new(),
-                            });
-                        }
-                        t_cons = *t_ret;
-                    } else {
-                        errors.push(CheckError {
-                            message: "too few arguments in pattern".to_string(),
-                            primary_label: "constructor has more arguments than pattern".to_string(),
-                            primary_label_loc: span.clone(),
-                            secondary_labels: Vec::new(),
-                            notes: Vec::new(),
-                        });
-                        return (Monotype::Base(BaseType::Bottom), Vec::new());
-                    }
-                }
-
-                if let Monotype::Func(_, _) = t_cons {
-                    errors.push(CheckError {
-                        message: "too many arguments in pattern".to_string(),
-                        primary_label: "constructor has fewer arguments than pattern".to_string(),
-                        primary_label_loc: span.clone(),
-                        secondary_labels: Vec::new(),
-                        notes: Vec::new(),
-                    });
-                    (Monotype::Base(BaseType::Bottom), new_env)
-                } else {
-                    (t_cons, new_env)
-                }
-            } else {
-                (Monotype::Base(BaseType::Bottom), Vec::new())
-            }
-        }
-
-        Pattern::SymbolOrUnitConstructor(_, name) => {
-            if let Some(t_cons) = env.find_cons(name) {
-                if let Monotype::Func(_, _) = t_cons {
-                    let t = env.new_var();
-                    (t.clone(), vec![(name.clone(), t)])
-                } else {
-                    (t_cons, Vec::new())
-                }
-            } else {
-                let t = env.new_var();
-                (t.clone(), vec![(name.clone(), t)])
-            }
-        }
-
-        Pattern::As(span, name, pat) => {
-            let (t_pat, mut new_env) = typecheck_pattern(pat, env, errors);
-            if new_env.iter().any(|(v, _)| v == name) {
-                errors.push(CheckError {
-                    message: "variable declared multiple times in pattern".to_string(),
-                    primary_label: format!("variable `{}` declared at least twice", name),
-                    primary_label_loc: span.clone(),
-                    secondary_labels: Vec::new(),
-                    notes: Vec::new(),
-                });
-            } else {
-                new_env.push((name.clone(), t_pat.clone()));
-            }
-
-            (t_pat, new_env)
-        }
-
-        Pattern::Or(span, cases) => {
-            let mut t = Monotype::Base(BaseType::Bottom);
-            let mut new_env = Vec::new();
-            let mut first = true;
-            for case in cases {
-                if first {
-                    (t, new_env) = typecheck_pattern(case, env, errors);
-                    first = false;
-                    continue;
-                }
-
-                let (mut t_case, mut variant) = typecheck_pattern(case, env, errors);
-                if !env.unify(&mut t, &mut t_case) {
-                    errors.push(CheckError {
-                        message: "or pattern has incompatible types".to_string(),
-                        primary_label: format!("found incompatible types `{}` and `{}`", t, t_case),
-                        primary_label_loc: span.clone(),
-                        secondary_labels: Vec::new(),
-                        notes: Vec::new(),
-                    });
-                    return (Monotype::Base(BaseType::Bottom), Vec::new())
-                }
-
-                if variant.len() != new_env.len() {
-                    errors.push(CheckError {
-                        message: "incompatible variable count".to_string(),
-                        primary_label: "or pattern has inconsistent number of variables".to_string(),
-                        primary_label_loc: span.clone(),
-                        secondary_labels: Vec::new(),
-                        notes: Vec::new(),
-                    });
-                    return (Monotype::Base(BaseType::Bottom), Vec::new())
-                }
-
-                for (n1, t1) in new_env.iter_mut() {
-                    if !variant.iter_mut().any(|(n2, t2)| n1 == n2 && env.unify(t1, t2)) {
-                        errors.push(CheckError {
-                            message: "unshared variable found in or pattern".to_string(),
-                            primary_label: format!("variable `{}` not shared amongst patterns", n1),
-                            primary_label_loc: span.clone(),
-                            secondary_labels: Vec::new(),
-                            notes: Vec::new(),
-                        });
-                        return (Monotype::Base(BaseType::Bottom), Vec::new())
-                    }
-                }
-            }
-
-            (t, new_env)
-        }
-    }
-}
-
-pub fn typecheck(asts: &mut [Ast]) -> Result<HashMap<String, Type>, Vec<CheckError>> {
-    let mut env = Environment::default().init_defaults();
-    let mut errors = Vec::new();
-
-    for ast in asts.iter() {
-        match ast {
-            Ast::EmptyLet { span, symbol, type_, .. } => {
-                if let Some((_, t)) = env.variables.iter_mut().rev().find(|(n, _)| n == symbol) {
-                    let mut type_ = type_.clone();
-                    std::mem::swap(&mut type_, t);
-                    let mut t = env.find_var(symbol).expect("we literally just had this");
-                    if !env.unify(&mut t, &mut type_.monotype) {
-                        errors.push(CheckError {
-                            message: "top level definition has conflicting types".to_string(),
-                            primary_label: format!("`{}` has both types `{}` and `{}`", symbol, t, type_),
-                            primary_label_loc: span.clone(),
-                            secondary_labels: Vec::new(),
-                            notes: Vec::new(),
-                        });
-                    }
-                } else {
-                    env.push_var(symbol.clone(), type_.clone());
-                }
-            }
-
-            Ast::TopLet { span, symbol, args, .. } => {
-                let mut monotype = env.new_var();
-                for _ in args {
-                    monotype = Monotype::Func(Box::new(env.new_var()), Box::new(monotype));
-                }
-
-                let mut type_ = Type {
-                    foralls: Vec::new(),
-                    constraints: Vec::new(),
-                    monotype,
                 };
 
-                if let Some(mut t) = env.find_var(symbol) {
-                    if !env.unify(&mut t, &mut type_.monotype) {
-                        errors.push(CheckError {
-                            message: "top level definition has conflicting types".to_string(),
-                            primary_label: format!("`{}` has both types `{}` and `{}`", symbol, t, type_),
-                            primary_label_loc: span.clone(),
-                            secondary_labels: Vec::new(),
-                            notes: Vec::new(),
-                        });
-                    }
+                let self_type = if generics.is_empty() {
+                    Type::Name(name.clone())
                 } else {
-                    env.push_var(symbol.clone(), type_.clone());
-                }
-            }
-
-            Ast::DatatypeDefinition { name, constraints, generics, variants, .. } => {
-                let t = Type {
-                    foralls: generics.clone(),
-                    constraints: constraints.clone(),
-                    monotype: Monotype::Base(BaseType::Named(name.clone(), generics.iter().map(|v| Monotype::Generic(v.clone())).collect())),
+                    Type::App(
+                        Box::new(Type::Name(name.clone())),
+                        generics.iter().map(|g| Type::Generic(g.clone())).collect())
                 };
 
-                for (cons, fields) in variants {
-                    let mut monotype = t.monotype.clone();
-                    for (_, field_type) in fields.iter().rev() {
-                        monotype = Monotype::Func(Box::new(field_type.clone()), Box::new(monotype));
-                    }
-
-                    let type_ = Type {
-                        foralls: t.foralls.clone(),
-                        constraints: t.constraints.clone(),
-                        monotype,
+                for variant in variants {
+                    let Entry::Vacant(v) = globals.entry(variant.name.clone())
+                    else {
+                        return Err(TypeError {
+                            message: format!("redefinition of {}", variant.name),
+                        });
                     };
-                    env.constructors.insert(cons.clone(), type_.clone());
-                    env.push_var(cons.clone(), type_);
+
+                    v.insert(GlobalData {
+                        type_: Type::Func(
+                            variant.fields.clone(),
+                            Box::new(self_type.clone())),
+                        variant_of: Some(name.clone()),
+                    });
                 }
+
+                let data = TypeData {
+                    va_params: false,
+                    params: generics.clone(),
+                    variants: variants.clone(),
+                };
+                v.insert(data);
             }
 
-            Ast::Class { span, name, generics, constraints, functions } => {
-                let mut class = Class {
-                    parameter_count: generics.len(),
-                    instances: Vec::new(),
-                    superclasses: HashMap::new(),
-                };
-
-                'a: for (superclass, s_generics) in constraints {
-                    if !env.classes.contains_key(superclass) {
-                        errors.push(CheckError {
-                            message: "superclass is undefined".to_string(),
-                            primary_label: format!("superclass `{}` was referenced here", superclass),
-                            primary_label_loc: span.clone(),
-                            secondary_labels: Vec::new(),
-                            notes: Vec::new(),
-                        });
-                        continue;
-                    }
-
-                    let mut built = Vec::new();
-                    for g in s_generics {
-                        let Some((i, _)) = generics.iter().enumerate().find(|(_, s)| *s == g)
-                        else {
-                            errors.push(CheckError {
-                                message: "typevariable not found".to_string(),
-                                primary_label: format!("typevariable `{}` never defined", g),
-                                primary_label_loc: span.clone(),
-                                secondary_labels: Vec::new(),
-                                notes: Vec::new(),
-                            });
-                            continue 'a;
-                        };
-                        built.push(i);
-                    }
-
-                    class.superclasses.insert(superclass.clone(), built);
-                }
-
-                let Entry::Vacant(entry) = env.classes.entry(name.clone())
+            TopLevel::FuncDef { name, args, ret, .. } => {
+                let Entry::Vacant(v) = globals.entry(name.clone())
                 else {
-                    errors.push(CheckError {
-                        message: "class defined multiple times".to_string(),
-                        primary_label: format!("class `{}` defined a second time here", name),
-                        primary_label_loc: span.clone(),
-                        secondary_labels: Vec::new(),
-                        notes: Vec::new(),
+                    return Err(TypeError {
+                        message: format!("redefinition of {name}"),
                     });
-                    continue;
                 };
 
-                entry.insert(class);
-
-                for func in functions {
-                    if let Ast::EmptyLet { symbol, type_, .. } = func {
-                        env.push_var(symbol.clone(), type_.clone());
-                    }
-                }
+                let fn_args: Vec<_> = args.iter().map(|(_, t)| t.clone()).collect();
+                v.insert(GlobalData {
+                    type_: Type::Func(fn_args, Box::new(ret.clone())),
+                    variant_of: None,
+                });
             }
-
-            Ast::Instance { span, name, generics, parameters, constraints, .. } => {
-                let instance = Instance {
-                    generics: generics.clone(),
-                    parameters: parameters.clone(),
-                    constraints: constraints.clone(),
-                };
-
-                let Some(class) = env.classes.get_mut(name)
-                else {
-                    errors.push(CheckError {
-                        message: "attempted to create instance of nonexistent class".to_string(),
-                        primary_label: format!("class `{}` is undefined", name),
-                        primary_label_loc: span.clone(),
-                        secondary_labels: Vec::new(),
-                        notes: Vec::new(),
-                    });
-                    continue;
-                };
-
-                if parameters.len() != class.parameter_count {
-                    errors.push(CheckError {
-                        message: "mismatched number of parameters".to_string(),
-                        primary_label: format!("class `{}` expects {} parameters, received {} parameters", name, class.parameter_count, parameters.len()),
-                        primary_label_loc: span.clone(),
-                        secondary_labels: Vec::new(),
-                        notes: Vec::new(),
-                    });
-                    continue;
-                }
-
-                class.instances.push(instance);
-            }
-
-            _ => (),
         }
     }
 
-    for ast in asts.iter_mut() {
-        typecheck_helper(ast, &mut env, &mut errors);
+    // verify types in globals (type variants are globals so this is sufficient)
+    for (_, data) in globals.iter() {
+        verify_type(&data.type_, &defined_types)?;
     }
 
-    env.update_all_var_types();
+    // typecheck statements
+    for top in ast {
+        let TopLevel::FuncDef { name, args, ret, stats } = top
+        else {
+            continue;
+        };
 
-    if errors.is_empty() {
-        Ok(env.variables.into_iter().collect())
+        let mut scopes = vec![HashMap::new()];
+        for (name, ty) in args {
+            scopes[0].insert(name.clone(), ty.clone());
+        }
+
+        let mut has_ret = false;
+        for stat in stats {
+            has_ret |= typecheck_stat(&mut type_vars, &defined_types, &globals, &mut scopes, stat, &ret, false)?;
+        }
+
+        match ret {
+            Type::Name(n) if n == "Unit" => (),
+            _ if !has_ret => return Err(TypeError {
+                message: format!("function {name} must terminate with return")
+            }),
+            _ => (),
+        }
+
+        for i in 0..type_vars.len() {
+            if is_typevar_unset(&type_vars, i) {
+                return Err(TypeError {
+                    message: format!("type variable {i} remains unset after type checking {name}"),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn typecheck_stat(
+    type_vars: &mut Vec<Type>,
+    defined_types: &HashMap<String, TypeData>,
+    globals: &HashMap<String, GlobalData>,
+    scopes: &mut Vec<HashMap<String, Type>>,
+    stat: &Statement,
+    expected_ret: &Type,
+    in_loop: bool,
+) -> Result<bool, TypeError> {
+    match stat {
+        Statement::FuncCall { func, args } => {
+            let mut a = Vec::new();
+            for arg in args {
+                a.push(typecheck_expr(type_vars, globals, scopes, arg)?);
+            }
+
+            let f = lookup(type_vars, globals, scopes, func)?;
+            let ret = valid_call(type_vars, &f, &a)?;
+            unify(type_vars, ret, &Type::Name("Unit".to_string()))?;
+            Ok(false)
+        }
+
+        Statement::Let { name, value } => {
+            let ty = typecheck_expr(type_vars, globals, scopes, value)?;
+            scopes.last_mut().unwrap().insert(name.clone(), ty);
+            Ok(false)
+        }
+
+        Statement::Set { name, value } => {
+            let ty = typecheck_expr(type_vars, globals, scopes, value)?;
+            let local = &lookup_local(type_vars, scopes, name)?;
+            unify(type_vars, local, &ty)?;
+            Ok(false)
+        }
+
+        Statement::Loop { body } => {
+            scopes.push(HashMap::new());
+            for stat in body {
+                typecheck_stat(type_vars, defined_types, globals, scopes, stat, expected_ret, true)?;
+            }
+
+            scopes.pop();
+            Ok(false)
+        }
+
+        Statement::Break | Statement::Continue => {
+            if in_loop {
+                Ok(false)
+            } else {
+                Err(TypeError {
+                    message: "tried to use loop control flow outside of a loop".to_string(),
+                })
+            }
+        }
+
+        Statement::Return(v) => {
+            let ty = match v {
+                Some(v) => typecheck_expr(type_vars, globals, scopes, &v)?,
+                None => Type::Name("Unit".to_owned()),
+            };
+            unify(type_vars, &ty, expected_ret)?;
+            Ok(true)
+        }
+
+        Statement::If { cond, then, elsy } => {
+            let ty = typecheck_expr(type_vars, globals, scopes, cond)?;
+            match ty.func_of_app() {
+                Type::Name(n) => {
+                    let Some(data) = defined_types.get(n)
+                    else {
+                        return Err(TypeError {
+                            message: format!("type {n} was not exist"),
+                        });
+                    };
+
+                    if data.variants.len() != 2
+                        || !data.variants[0].fields.is_empty()
+                        || !data.variants[1].fields.is_empty()
+                    {
+                        return Err(TypeError {
+                            message: format!("type {n} is incompatible with if"),
+                        });
+                    }
+
+                    scopes.push(HashMap::new());
+                    let mut then_ret = false;
+                    for stat in then.iter() {
+                        then_ret |= typecheck_stat(type_vars, defined_types, globals, scopes, stat, expected_ret, in_loop)?;
+                    }
+                    scopes.pop();
+
+                    scopes.push(HashMap::new());
+                    let mut else_ret = false;
+                    for stat in elsy.iter() {
+                        else_ret |= typecheck_stat(type_vars, defined_types, globals, scopes, stat, expected_ret, in_loop)?;
+                    }
+                    scopes.pop();
+
+                    Ok(then_ret && else_ret)
+                }
+
+                _ => Err(TypeError {
+                    message: format!("cannot use if on type {ty}"),
+                })
+            }
+        }
+
+        Statement::Match { value, branches } => {
+            let t = typecheck_expr(type_vars, globals, scopes, value)?;
+
+            let mut ret = !branches.is_empty();
+            for (pat, stats) in branches {
+                let mut map = HashMap::new();
+                let tp = typecheck_pat(type_vars, globals, defined_types, &mut map, pat)?;
+                unify(type_vars, &t, &tp)?;
+                scopes.push(map);
+
+                let mut branch_ret = false;
+                for stat in stats {
+                    branch_ret |= typecheck_stat(type_vars, defined_types, globals, scopes, stat, expected_ret, in_loop)?;
+                }
+
+                ret &= branch_ret;
+                scopes.pop();
+            }
+
+            Ok(ret)
+        }
+    }
+}
+
+fn typecheck_pat(
+    type_vars: &mut Vec<Type>,
+    globals: &HashMap<String, GlobalData>,
+    defined_types: &HashMap<String, TypeData>,
+    map: &mut HashMap<String, Type>,
+    pat: &Pattern
+) -> Result<Type, TypeError> {
+    match pat {
+        Pattern::Wildcard => Ok(create_typevar(type_vars)),
+
+        Pattern::Symbol(x) => {
+            let t = create_typevar(type_vars);
+            map.insert(x.clone(), t.clone());
+            Ok(t)
+        }
+
+        Pattern::Variant { name, args, exhaustive } => {
+            let Some(type_name) = globals.get(name)
+                .and_then(|v| v.variant_of.as_ref())
+            else {
+                return Err(TypeError {
+                    message: format!("{name} is not a variant of a type"),
+                });
+            };
+
+            let Some(type_data) = defined_types.get(type_name)
+            else {
+                unreachable!();
+            };
+
+            let t = if type_data.params.is_empty() {
+                Type::Name(type_name.clone())
+            } else {
+                Type::App(
+                    Box::new(Type::Name(type_name.clone())),
+                    type_data.params.iter().map(|g| Type::Generic(g.clone())).collect(),
+                )
+            };
+
+            let mut generics_map = HashMap::new();
+            let t = instantiate_generics_with_map(&mut generics_map, type_vars, &t);
+
+            let Some(variant) = type_data.variants.iter().find(|v| v.name == *name)
+            else {
+                unreachable!();
+            };
+
+            let exhaustive = *exhaustive;
+            if exhaustive && variant.fields.len() != args.len() {
+                return Err(TypeError {
+                    message: format!("variant {name} from {type_name} is given the incorrect arguments in a pattern"),
+                });
+            }
+
+            if !exhaustive && variant.fields.len() < args.len() {
+                return Err(TypeError {
+                    message: format!("variant {name} from {type_name} is given too many arguments in a pattern"),
+                });
+            }
+
+            for (p, t) in args.iter().zip(variant.fields.iter()) {
+                let t = instantiate_generics_with_map(&mut generics_map.clone(), type_vars, &t);
+                let t_pat = typecheck_pat(type_vars, globals, defined_types, map, p)?;
+                unify(type_vars, &t, &t_pat)?;
+            }
+
+            Ok(t)
+        }
+
+        Pattern::Or(pats) => {
+            let mut t = create_typevar(type_vars);
+            let mut first = true;
+            let mut temp_map = HashMap::new();
+
+            for pat in pats {
+                let mut m = HashMap::new();
+                let tp = typecheck_pat(type_vars, globals, defined_types, &mut m, pat)?;
+                t = unify(type_vars, &t, &tp)?;
+
+                if first {
+                    temp_map = m;
+                    first = false;
+                } else {
+                    if temp_map.len() != m.len() {
+                        return Err(TypeError {
+                            message: format!("environments from patterns in or pattern are different")
+                        });
+                    }
+
+                    for (x, t) in m {
+                        if let Some(t2) = temp_map.get(&x) {
+                            unify(type_vars, &t, t2)?;
+                        } else {
+                            return Err(TypeError {
+                                message: format!("variable {x} found in one pattern but not in another in or pattern"),
+                            });
+                        }
+                    }
+                }
+            }
+
+            map.extend(temp_map);
+            Ok(t)
+        }
+    }
+}
+
+fn typecheck_expr(
+    type_vars: &mut Vec<Type>,
+    globals: &HashMap<String, GlobalData>,
+    scopes: &mut Vec<HashMap<String, Type>>,
+    expr: &Expr,
+) -> Result<Type, TypeError> {
+    match expr {
+        Expr::Integer(_) => Ok(Type::Name("Int".to_string())),
+        Expr::String(_) => Ok(Type::Name("String".to_string())),
+        Expr::Symbol(s) => lookup(type_vars, globals, scopes, s),
+
+        Expr::FuncCall { func, args } => {
+            let f = typecheck_expr(type_vars, globals, scopes, &func)?;
+            let mut a = Vec::new();
+            for a_orig in args {
+                a.push(typecheck_expr(type_vars, globals, scopes, a_orig)?)
+            }
+
+            valid_call(type_vars, &f, &a).cloned()
+        }
+    }
+}
+
+#[allow(unused)]
+fn lookup_global<'a>(
+    type_vars: &mut Vec<Type>,
+    globals: &'a HashMap<String, GlobalData>,
+    ident: &str,
+) -> Result<Type, TypeError> {
+    if let Some(data) = globals.get(ident) {
+        Ok(instantiate_generics(type_vars, &data.type_))
     } else {
-        Err(errors)
+        Err(TypeError {
+            message: format!("global {ident} does not exist"),
+        })
+    }
+}
+
+fn lookup_local<'a>(
+    type_vars: &mut Vec<Type>,
+    scopes: &'a Vec<HashMap<String, Type>>,
+    ident: &str,
+) -> Result<Type, TypeError> {
+    for scope in scopes.iter().rev() {
+        if let Some(t) = scope.get(ident) {
+            return Ok(instantiate_generics(type_vars, t));
+        }
+    }
+
+    Err(TypeError {
+        message: format!("identifier {ident} was never defined locally"),
+    })
+}
+
+fn lookup<'a>(
+    type_vars: &mut Vec<Type>,
+    globals: &'a HashMap<String, GlobalData>,
+    scopes: &'a Vec<HashMap<String, Type>>,
+    ident: &str,
+) -> Result<Type, TypeError> {
+    for scope in scopes.iter().rev() {
+        if let Some(t) = scope.get(ident) {
+            return Ok(instantiate_generics(type_vars, t));
+        }
+    }
+
+    if let Some(data) = globals.get(ident) {
+        Ok(instantiate_generics(type_vars, &data.type_))
+    } else {
+        Err(TypeError {
+            message: format!("identifier {ident} was never defined"),
+        })
+    }
+}
+
+fn create_typevar(type_vars: &mut Vec<Type>) -> Type {
+    let v = type_vars.len();
+    type_vars.push(Type::Typevar(v));
+    Type::Typevar(v)
+}
+
+fn instantiate_generics_with_map(
+    generics: &mut HashMap<String, Type>,
+    type_vars: &mut Vec<Type>,
+    t: &Type,
+) -> Type {
+    match t {
+        Type::Generic(g) => {
+            match generics.entry(g.clone()) {
+                Entry::Occupied(v) => v.get().clone(),
+                Entry::Vacant(v) => {
+                    let t = create_typevar(type_vars);
+                    v.insert(t.clone());
+                    t
+                }
+            }
+        }
+
+        Type::Func(a, r) => Type::Func(
+            a.iter().map(|t| instantiate_generics_with_map(generics, type_vars, t)).collect(),
+            Box::new(instantiate_generics_with_map(generics, type_vars, r)),
+        ),
+
+        Type::App(f, a) => Type::App(
+            Box::new(instantiate_generics_with_map(generics, type_vars, f)),
+            a.iter().map(|t| instantiate_generics_with_map(generics, type_vars, t)).collect()
+        ),
+
+        _ => t.clone(),
+    }
+}
+
+fn instantiate_generics(
+    type_vars: &mut Vec<Type>,
+    t: &Type,
+) -> Type {
+    instantiate_generics_with_map(&mut HashMap::new(), type_vars, t)
+}
+
+fn verify_type(t: &Type, defined_types: &HashMap<String, TypeData>) -> Result<(), TypeError> {
+    fn helper(t: &Type, defined_types: &HashMap<String, TypeData>) -> Result<Option<usize>, TypeError> {
+        match t {
+            Type::Typevar(_) | Type::Generic(_) => Ok(None),
+
+            Type::Name(n) => {
+                let Some(data) = defined_types.get(n)
+                else {
+                    return Err(TypeError {
+                        message: format!("type {t} was never defined"),
+                    });
+                };
+
+                if data.va_params {
+                    Ok(None)
+                } else {
+                    Ok(Some(data.params.len()))
+                }
+            }
+
+            Type::Func(args, ret) => {
+                for arg in args {
+                    let (Some(0) | None) = helper(arg, defined_types)?
+                    else {
+                        return Err(TypeError {
+                            message: format!("function parameter {arg} should have 0 expected type parameters"),
+                        });
+                    };
+                }
+
+                let (Some(0) | None) = helper(ret, defined_types)?
+                else {
+                    return Err(TypeError {
+                        message: format!("function return {ret} should have 0 expected type parameters"),
+                    });
+                };
+
+                Ok(Some(0))
+            }
+
+            Type::App(f, a) => {
+                for a in a {
+                    let (Some(0) | None) = helper(a, defined_types)?
+                    else {
+                        return Err(TypeError {
+                            message: format!("type parameter {a} should have 0 expected type parameters"),
+                        });
+                    };
+                }
+
+                let Some(expected_count) = helper(f, defined_types)?
+                else {
+                    return Ok(Some(0))
+                };
+
+                if expected_count != a.len() {
+                    return Err(TypeError {
+                        message: format!("expected {expected_count} type parameters for type {t}, got {}", a.len()),
+                    });
+                }
+
+                Ok(Some(0))
+            }
+        }
+    }
+
+    if let Some(0) | None = helper(t, defined_types)? {
+        Ok(())
+    } else {
+        Err(TypeError {
+            message: format!("type {t} should expect 0 type parameters"),
+        })
+    }
+}
+
+fn valid_call<'a>(
+    type_vars: &mut Vec<Type>,
+    f: &'a Type,
+    args: &[Type],
+) -> Result<&'a Type, TypeError> {
+    match f {
+        Type::Func(params, ret) => {
+            if args.len() != params.len() {
+                return Err(TypeError {
+                    message: format!("passed in {} arguments when expected {}", args.len(), params.len()),
+                });
+            }
+
+            for (a, t) in args.iter().zip(params.iter()) {
+                unify(type_vars, a, t)?;
+            }
+            Ok(&ret)
+        }
+
+        _ => Err(TypeError {
+            message: format!("type {f} is not callable"),
+        })
+    }
+}
+
+fn get_typevar_index(
+    type_vars: &Vec<Type>,
+    mut i: usize,
+) -> usize {
+    loop {
+        let new_t = &type_vars[i];
+        match new_t {
+            &Type::Typevar(j) if i == j => return i,
+            &Type::Typevar(j) => i = j,
+            _ => return i,
+        }
+    }
+}
+
+fn is_typevar_unset(
+    type_vars: &Vec<Type>,
+    v: usize,
+) -> bool {
+    matches!(type_vars[v], Type::Typevar(i) if i == v)
+}
+
+fn unify(
+    type_vars: &mut Vec<Type>,
+    t1: &Type,
+    t2: &Type,
+) -> Result<Type, TypeError> {
+    match (t1, t2) {
+        (&Type::Typevar(v1), &Type::Typevar(v2)) => {
+            let v1 = get_typevar_index(type_vars, v1);
+            let v2 = get_typevar_index(type_vars, v2);
+
+            if is_typevar_unset(type_vars, v1) {
+                type_vars[v1] = type_vars[v2].clone();
+                Ok(type_vars[v2].clone())
+            } else if is_typevar_unset(type_vars, v2) {
+                type_vars[v2] = type_vars[v1].clone();
+                Ok(type_vars[v1].clone())
+            } else {
+                unify(type_vars, &type_vars[v1].clone(), &type_vars[v2].clone())
+            }
+        }
+
+        (&Type::Typevar(v), t) | (t, &Type::Typevar(v)) => {
+            let v = get_typevar_index(type_vars, v);
+            if is_typevar_unset(type_vars, v) {
+                type_vars[v] = t.clone();
+                Ok(t.clone())
+            } else {
+                let t = unify(type_vars, &type_vars[v].clone(), t)?;
+                type_vars[v] = t.clone();
+                Ok(t)
+            }
+        }
+
+        (Type::Name(n1), Type::Name(n2)) if n1 == n2 => Ok(t1.clone()),
+
+        (Type::Func(a1, r1), Type::Func(a2, r2)) => {
+            if a1.len() != a2.len() {
+                return Err(TypeError {
+                    message: format!("types {} and {} cannot be unified", t1, t2),
+                });
+            }
+
+            let mut a = Vec::new();
+            for (a1, a2) in a1.iter().zip(a2.iter()) {
+                a.push(unify(type_vars, a1, a2)?);
+            }
+
+            let r = unify(type_vars, r1, r2)?;
+
+            Ok(Type::Func(a, Box::new(r)))
+        }
+
+        (Type::App(f1, a1), Type::App(f2, a2)) => {
+            let f = unify(type_vars, f1, f2)?;
+
+            if a1.len() != a2.len() {
+                return Err(TypeError {
+                    message: format!("types {} and {} cannot be unified", t1, t2),
+                });
+            }
+
+            let mut a = Vec::new();
+            for (a1, a2) in a1.iter().zip(a2) {
+                a.push(unify(type_vars, a1, a2)?);
+            }
+
+            Ok(Type::App(Box::new(f), a))
+        }
+
+        _ => Err(TypeError {
+            message: format!("types {t1} and {t2} cannot be unified"),
+        }),
     }
 }

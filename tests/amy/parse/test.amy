@@ -1,0 +1,6 @@
+def main() do
+   match create_list()
+      as x :: xs to uwu()
+      as _ to owo()
+   end
+end

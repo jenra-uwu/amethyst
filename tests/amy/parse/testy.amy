@@ -1,0 +1,14 @@
+type Option[a] as
+    Some(a)
+    None
+end
+
+type List[a] as
+    ::(a, List[a])
+    Nil
+end
+
+type Bool as
+    True
+    False
+end
