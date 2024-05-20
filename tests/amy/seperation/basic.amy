@@ -1,0 +1,6 @@
+def main() do
+	let p = alloc(0)
+	let _ = p := 1
+	let _ = p := p!
+	dealloc(p)
+end

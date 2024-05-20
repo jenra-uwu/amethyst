@@ -16,6 +16,20 @@ impl Type {
             _ => self
         }
     }
+
+    pub fn generates_pointer(&self) -> bool {
+        let Type::Func(_, r) = self
+        else {
+            return false;
+        };
+
+        let Type::Name(s) = r.func_of_app()
+        else {
+            return false;
+        };
+
+        s == "Pointer"
+    }
 }
 
 impl Display for Type {

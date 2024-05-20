@@ -1,10 +1,9 @@
 use std::collections::{HashMap, hash_map::Entry};
 
-use crate::ast::*;
+use crate::{ast::*, seperation::{Pointer, Store}};
 
 #[derive(Debug)]
 struct TypeData {
-    va_params: bool,
     params: Vec<String>,
     variants: Vec<Variant>,
 }
@@ -18,36 +17,70 @@ pub struct TypeError {
     pub message: String,
 }
 
-pub fn typecheck(ast: &[TopLevel]) -> Result<(), TypeError> {
-    // set up scopes
+fn initial_values() -> (HashMap<String, GlobalData>, HashMap<String, TypeData>) {
     let mut globals = HashMap::new();
-    let mut defined_types = HashMap::new();
-    let mut type_vars = Vec::new();
-    defined_types.insert("Tuple".to_owned(), TypeData {
-        va_params: true,
-        params: Vec::new(),
-        variants: Vec::new(),
+    globals.insert("!".to_owned(), GlobalData {
+        type_: Type::Func(
+            vec![Type::App(Box::new(Type::Name("Pointer".to_owned())), vec![Type::Generic("T".to_owned())])],
+            Box::new(Type::Generic("T".to_owned()))),
+        variant_of: None,
     });
+    globals.insert(":=".to_owned(), GlobalData {
+        type_: Type::Func(
+            vec![
+                Type::App(Box::new(Type::Name("Pointer".to_owned())), vec![Type::Generic("T".to_owned())]),
+                Type::Generic("T".to_owned()),
+            ],
+            Box::new(Type::Name("Unit".to_owned()))),
+        variant_of: None,
+    });
+    globals.insert("alloc".to_owned(), GlobalData {
+        type_: Type::Func(
+            vec![Type::Generic("T".to_owned())],
+            Box::new(Type::App(Box::new(Type::Name("Pointer".to_owned())), vec![Type::Generic("T".to_owned())]))),
+        variant_of: None,
+    });
+    globals.insert("dealloc".to_owned(), GlobalData {
+        type_: Type::Func(
+            vec![Type::App(Box::new(Type::Name("Pointer".to_owned())), vec![Type::Generic("T".to_owned())])],
+            Box::new(Type::Name("Unit".to_owned()))),
+        variant_of: None,
+    });
+    globals.insert("Unit".to_owned(), GlobalData {
+        type_: Type::Func(
+            vec![],
+            Box::new(Type::Name("Unit".to_owned()))),
+        variant_of: Some("Unit".to_owned()),
+    });
+
+    let mut defined_types = HashMap::new();
     defined_types.insert("Int".to_owned(), TypeData {
-        va_params: false,
         params: Vec::new(),
         variants: Vec::new(),
     });
     defined_types.insert("Unit".to_owned(), TypeData {
-        va_params: false,
         params: Vec::new(),
-        variants: Vec::new(),
+        variants: vec![Variant {
+            name: "Unit".to_owned(),
+            fields: Vec::new(),
+        }],
     });
     defined_types.insert("String".to_owned(), TypeData {
-        va_params: false,
         params: Vec::new(),
         variants: Vec::new(),
     });
     defined_types.insert("Pointer".to_owned(), TypeData {
-        va_params: false,
         params: vec!["T".to_string()],
         variants: Vec::new(),
     });
+
+    (globals, defined_types)
+}
+
+pub fn typecheck(ast: &[TopLevel]) -> Result<(), TypeError> {
+    // set up scopes
+    let (mut globals, mut defined_types) = initial_values();
+    let mut type_vars = Vec::new();
 
     // get all globals (functions and type definitions)
     for top in ast {
@@ -85,7 +118,6 @@ pub fn typecheck(ast: &[TopLevel]) -> Result<(), TypeError> {
                 }
 
                 let data = TypeData {
-                    va_params: false,
                     params: generics.clone(),
                     variants: variants.clone(),
                 };
@@ -127,8 +159,9 @@ pub fn typecheck(ast: &[TopLevel]) -> Result<(), TypeError> {
         }
 
         let mut has_ret = false;
+        let mut store = Store::default();
         for stat in stats {
-            has_ret |= typecheck_stat(&mut type_vars, &defined_types, &globals, &mut scopes, stat, &ret, false)?;
+            has_ret |= typecheck_stat(&mut type_vars, &defined_types, &globals, &mut scopes, stat, &ret, false, &mut store)?;
         }
 
         match ret {
@@ -159,12 +192,13 @@ fn typecheck_stat(
     stat: &Statement,
     expected_ret: &Type,
     in_loop: bool,
+    store: &mut Store,
 ) -> Result<bool, TypeError> {
     match stat {
         Statement::FuncCall { func, args } => {
             let mut a = Vec::new();
             for arg in args {
-                a.push(typecheck_expr(type_vars, globals, scopes, arg)?);
+                a.push(typecheck_expr(type_vars, globals, scopes, arg, store)?);
             }
 
             let f = lookup(type_vars, globals, scopes, func)?;
@@ -174,13 +208,13 @@ fn typecheck_stat(
         }
 
         Statement::Let { name, value } => {
-            let ty = typecheck_expr(type_vars, globals, scopes, value)?;
+            let ty = typecheck_expr(type_vars, globals, scopes, value, store)?;
             scopes.last_mut().unwrap().insert(name.clone(), ty);
             Ok(false)
         }
 
         Statement::Set { name, value } => {
-            let ty = typecheck_expr(type_vars, globals, scopes, value)?;
+            let ty = typecheck_expr(type_vars, globals, scopes, value, store)?;
             let local = &lookup_local(type_vars, scopes, name)?;
             unify(type_vars, local, &ty)?;
             Ok(false)
@@ -189,7 +223,7 @@ fn typecheck_stat(
         Statement::Loop { body } => {
             scopes.push(HashMap::new());
             for stat in body {
-                typecheck_stat(type_vars, defined_types, globals, scopes, stat, expected_ret, true)?;
+                typecheck_stat(type_vars, defined_types, globals, scopes, stat, expected_ret, true, store)?;
             }
 
             scopes.pop();
@@ -208,7 +242,7 @@ fn typecheck_stat(
 
         Statement::Return(v) => {
             let ty = match v {
-                Some(v) => typecheck_expr(type_vars, globals, scopes, &v)?,
+                Some(v) => typecheck_expr(type_vars, globals, scopes, &v, store)?,
                 None => Type::Name("Unit".to_owned()),
             };
             unify(type_vars, &ty, expected_ret)?;
@@ -216,7 +250,7 @@ fn typecheck_stat(
         }
 
         Statement::If { cond, then, elsy } => {
-            let ty = typecheck_expr(type_vars, globals, scopes, cond)?;
+            let ty = typecheck_expr(type_vars, globals, scopes, cond, store)?;
             match ty.func_of_app() {
                 Type::Name(n) => {
                     let Some(data) = defined_types.get(n)
@@ -238,14 +272,14 @@ fn typecheck_stat(
                     scopes.push(HashMap::new());
                     let mut then_ret = false;
                     for stat in then.iter() {
-                        then_ret |= typecheck_stat(type_vars, defined_types, globals, scopes, stat, expected_ret, in_loop)?;
+                        then_ret |= typecheck_stat(type_vars, defined_types, globals, scopes, stat, expected_ret, in_loop, store)?;
                     }
                     scopes.pop();
 
                     scopes.push(HashMap::new());
                     let mut else_ret = false;
                     for stat in elsy.iter() {
-                        else_ret |= typecheck_stat(type_vars, defined_types, globals, scopes, stat, expected_ret, in_loop)?;
+                        else_ret |= typecheck_stat(type_vars, defined_types, globals, scopes, stat, expected_ret, in_loop, store)?;
                     }
                     scopes.pop();
 
@@ -259,7 +293,7 @@ fn typecheck_stat(
         }
 
         Statement::Match { value, branches } => {
-            let t = typecheck_expr(type_vars, globals, scopes, value)?;
+            let t = typecheck_expr(type_vars, globals, scopes, value, store)?;
 
             let mut ret = !branches.is_empty();
             for (pat, stats) in branches {
@@ -270,7 +304,7 @@ fn typecheck_stat(
 
                 let mut branch_ret = false;
                 for stat in stats {
-                    branch_ret |= typecheck_stat(type_vars, defined_types, globals, scopes, stat, expected_ret, in_loop)?;
+                    branch_ret |= typecheck_stat(type_vars, defined_types, globals, scopes, stat, expected_ret, in_loop, store)?;
                 }
 
                 ret &= branch_ret;
@@ -394,17 +428,22 @@ fn typecheck_expr(
     globals: &HashMap<String, GlobalData>,
     scopes: &mut Vec<HashMap<String, Type>>,
     expr: &Expr,
+    store: &mut Store,
 ) -> Result<Type, TypeError> {
     match expr {
         Expr::Integer(_) => Ok(Type::Name("Int".to_string())),
         Expr::String(_) => Ok(Type::Name("String".to_string())),
-        Expr::Symbol(s) => lookup(type_vars, globals, scopes, s),
+        Expr::Symbol(s) => {
+            let t = lookup(type_vars, globals, scopes, s)?;
+            let _p = store.get_var(s);
+            Ok(t)
+        }
 
         Expr::FuncCall { func, args } => {
-            let f = typecheck_expr(type_vars, globals, scopes, &func)?;
+            let f = typecheck_expr(type_vars, globals, scopes, &func, store)?;
             let mut a = Vec::new();
             for a_orig in args {
-                a.push(typecheck_expr(type_vars, globals, scopes, a_orig)?)
+                a.push(typecheck_expr(type_vars, globals, scopes, a_orig, store)?)
             }
 
             valid_call(type_vars, &f, &a).cloned()
@@ -521,11 +560,7 @@ fn verify_type(t: &Type, defined_types: &HashMap<String, TypeData>) -> Result<()
                     });
                 };
 
-                if data.va_params {
-                    Ok(None)
-                } else {
-                    Ok(Some(data.params.len()))
-                }
+                Ok(Some(data.params.len()))
             }
 
             Type::Func(args, ret) => {
